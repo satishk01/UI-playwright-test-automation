@@ -1,0 +1,26 @@
+# Secrets — never commit credentials
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Build output
+client/dist/
+
+# Runtime artifacts — runs/ contains run-meta.json (auth + LLM credentials)
+# and auth-state.json (session cookies/tokens). Never commit.
+runs/
+test-results/
+playwright-report/
+
+# User-saved data — presets store auth credentials; registries store app URLs
+presets/
+registries/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
