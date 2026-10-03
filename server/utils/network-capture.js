@@ -16,7 +16,6 @@
 
 const DEFAULT_API_PATTERNS = [
   '/api/',
-  '/api?',
   'execute-api',
   'amazonaws.com',
   'graphql',

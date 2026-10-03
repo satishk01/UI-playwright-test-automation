@@ -163,9 +163,22 @@ function validateAppContext(input) {
     }
   }
 
+  // ── locale ──
+  // BCP-47 tag ('en-US', 'de-DE'). Pinned identically in the capture and
+  // test contexts so locale-sensitive page output (toLocaleDateString etc.)
+  // renders the same way in the baseline and at test execution time.
+  if ('locale' in input && input.locale != null && String(input.locale).trim() !== '') {
+    const loc = String(input.locale).trim();
+    if (loc.length > 35 || !/^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$/.test(loc)) {
+      errors.push(`locale "${loc}" is not a valid BCP-47 tag (e.g. en-US, de-DE)`);
+    } else {
+      out.locale = loc;
+    }
+  }
+
   // Reject unknown top-level keys — fail closed so typos don't silently pass
   // through and get ignored downstream.
-  const allowed = new Set(['baseURL', 'viewport', 'userAgent', 'extraHTTPHeaders', 'apiPatterns']);
+  const allowed = new Set(['baseURL', 'viewport', 'userAgent', 'extraHTTPHeaders', 'apiPatterns', 'locale']);
   const unknown = Object.keys(input).filter(k => !allowed.has(k));
   if (unknown.length > 0) {
     errors.push(`Unknown appContext keys: ${unknown.join(', ')}. Allowed: ${[...allowed].join(', ')}`);

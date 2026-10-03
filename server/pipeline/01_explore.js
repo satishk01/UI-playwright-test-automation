@@ -2,6 +2,14 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const { captureAccessibilityTree, captureIframeAccessibilityTrees } = require('../utils/accessibility');
 const { createNetworkTracker, summarizeApiCalls } = require('../utils/network-capture');
+const {
+  FIXED_CLOCK_TIME,
+  captureAriaSnapshot,
+  captureAriaBaseline,
+  captureAriaElements,
+  tagVisibilityFromSnapshot,
+  snapshotContentHash,
+} = require('../utils/aria-snapshot');
 
 class Explorer {
   constructor(targetUrl, auth, options = {}) {
@@ -43,6 +51,16 @@ class Explorer {
     //     test generation on the changed areas while still testing the page.
     this.targetScreens = Array.isArray(options.targetScreens) ? options.targetScreens : null;
     this.targetDepth = options.targetDepth != null ? parseInt(options.targetDepth, 10) : 0;
+
+    // Light/discovery crawl mode (registry building). Skips every heavy
+    // per-page capture — aria snapshots, CDP a11y tree, visibility tagging,
+    // disclosure discovery, forms/CAPTCHA/API capture — and keeps only what
+    // screen discovery needs: URL, title, path, and outbound links. Pages are
+    // captured concurrently (crawlConcurrency). Full snapshots still run in
+    // normal mode because the Planner/Generator consume them.
+    this.lightCrawl = !!options.lightCrawl;
+    this.crawlConcurrency = Math.max(1,
+      parseInt(options.crawlConcurrency || process.env.CRAWL_CONCURRENCY || '3', 10));
   }
 
   async explore() {
@@ -51,6 +69,15 @@ class Explorer {
     // that match prior behavior when appContext is empty.
     const contextOptions = {
       viewport: this.appContext.viewport || { width: 1280, height: 720 },
+      // Flake-class killers (§8): service workers cache stale assets and CSS
+      // animations race assertions — block/reduce both before they can reach
+      // the Healer.
+      serviceWorkers: 'block',
+      reducedMotion: 'reduce',
+      // Pin locale: pages format dates/numbers via toLocaleString — if the
+      // capture and test browsers resolve different OS locales, the aria
+      // baseline diff produces false failures (e.g. DD/MM vs MM/DD).
+      locale: this.appContext.locale || 'en-US',
     };
     if (this.appContext.baseURL) contextOptions.baseURL = this.appContext.baseURL;
     if (this.appContext.userAgent) contextOptions.userAgent = this.appContext.userAgent;
@@ -61,6 +88,22 @@ class Explorer {
 
     // Handle authentication
     const page = await context.newPage();
+
+    // Freeze the page clock (§2): time-dependent labels (countdowns, clock
+    // widgets, "today" pickers) render identically at capture and at test
+    // execution because generated specs install the same fixed time.
+    // The frozen clock exists so captured snapshots match test execution.
+    // Discovery crawls don't produce snapshots — and pausing the clock can
+    // actually prevent SPA timers from rendering links — so skip it there.
+    if (!this.lightCrawl && process.env.DISABLE_CLOCK !== '1') {
+      try {
+        await page.clock.install({ time: new Date(FIXED_CLOCK_TIME) });
+        await page.clock.pauseAt(new Date(FIXED_CLOCK_TIME));
+      } catch (err) {
+        console.warn(`clock.install failed, continuing without clock emulation: ${err.message}`);
+      }
+    }
+
     await this.authenticate(page);
 
     // Save storage state for reuse by Executor / generated tests
@@ -118,63 +161,97 @@ class Explorer {
       queue.push({ url: this.normalizeUrl(this.targetUrl), depth: 0 });
     }
 
-    while (queue.length > 0 && snapshots.length < pageCap) {
-      const { url, depth } = queue.shift();
-      if (visited.has(url)) continue;
-      if (depth > maxDepthForCrawl) continue;
+    const processEntry = async (pg, { url, depth }) => {
+      if (visited.has(url)) return;
+      if (depth > maxDepthForCrawl) return;
       visited.add(url);
 
       try {
-        const snapshot = await this.capturePage(page, url);
-        if (snapshot) {
-          // Deduplicate by path — avoid crawling /products?sort=price and /products?sort=name
-          // as separate pages when they render the same content.
-          if (visitedPaths.has(snapshot.path)) {
-            // Still count it as visited but don't add a duplicate snapshot
-            continue;
-          }
-          visitedPaths.add(snapshot.path);
+        const snapshot = this.lightCrawl
+          ? await this.capturePageLight(pg, url)
+          : await this.capturePage(pg, url);
+        if (!snapshot) return;
 
-          // In targeted mode, attach the user-provided screen label,
-          // functionality hints, and free-form description to the matching
-          // snapshot so downstream stages (Planner) can focus test generation
-          // on the changed areas and use the extra context.
-          if (functionalityByUrl) {
-            const meta = functionalityByUrl.get(url) ||
-              functionalityByUrl.get(this.normalizeUrl(snapshot.url));
-            if (meta) {
-              if (meta.name) snapshot.screenLabel = meta.name;
-              if (meta.functionality) snapshot.functionality = meta.functionality;
-              if (meta.description) snapshot.screenDescription = meta.description;
-              snapshot.isTargetedScreen = true;
-            }
-          }
+        // Deduplicate by path — avoid crawling /products?sort=price and /products?sort=name
+        // as separate pages when they render the same content. The dedupe key
+        // includes the hash when it's a client-side route (#/...): hash-router
+        // SPAs serve distinct screens under one pathname, so pathname alone
+        // would collapse all their routes into a single entry.
+        let dedupeKey = snapshot.path;
+        try {
+          const h = new URL(snapshot.url).hash;
+          if (/^#!?\/.+/.test(h)) dedupeKey += h;
+        } catch { /* keep path */ }
+        if (visitedPaths.has(dedupeKey)) {
+          // Still count it as visited but don't add a duplicate snapshot
+          return;
+        }
+        visitedPaths.add(dedupeKey);
 
-          snapshots.push(snapshot);
-
-          // Discover links for BFS — filter out non-content URLs.
-          // In targeted mode with targetDepth 0 we skip link discovery
-          // entirely (strict capture of only the listed screens).
-          if (depth < maxDepthForCrawl) {
-            const newLinks = [];
-            for (const link of snapshot.links) {
-              const normalized = this.normalizeUrl(link);
-              if (visited.has(normalized) || !this.isSameOrigin(normalized)) continue;
-              if (this.isNonContentUrl(normalized)) continue;
-              newLinks.push({ url: normalized, depth: depth + 1 });
-            }
-            // Prioritize links that are likely to have interactive content:
-            // pages with form-related or action-related path segments first.
-            newLinks.sort((a, b) => {
-              const aPriority = this.linkPriority(a.url);
-              const bPriority = this.linkPriority(b.url);
-              return bPriority - aPriority;
-            });
-            queue.push(...newLinks);
+        // In targeted mode, attach the user-provided screen label,
+        // functionality hints, and free-form description to the matching
+        // snapshot so downstream stages (Planner) can focus test generation
+        // on the changed areas and use the extra context.
+        if (functionalityByUrl) {
+          const meta = functionalityByUrl.get(url) ||
+            functionalityByUrl.get(this.normalizeUrl(snapshot.url));
+          if (meta) {
+            if (meta.name) snapshot.screenLabel = meta.name;
+            if (meta.functionality) snapshot.functionality = meta.functionality;
+            if (meta.description) snapshot.screenDescription = meta.description;
+            snapshot.isTargetedScreen = true;
           }
+        }
+
+        snapshots.push(snapshot);
+        if (this.lightCrawl) {
+          console.log(`[crawl] captured ${snapshots.length}: ${snapshot.url}`);
+        }
+
+        // Discover links for BFS — filter out non-content URLs.
+        // In targeted mode with targetDepth 0 we skip link discovery
+        // entirely (strict capture of only the listed screens).
+        if (depth < maxDepthForCrawl) {
+          const newLinks = [];
+          for (const link of snapshot.links) {
+            const normalized = this.normalizeUrl(link);
+            if (visited.has(normalized) || !this.isSameOrigin(normalized)) continue;
+            if (this.isNonContentUrl(normalized)) continue;
+            newLinks.push({ url: normalized, depth: depth + 1 });
+          }
+          // Prioritize links that are likely to have interactive content:
+          // pages with form-related or action-related path segments first.
+          newLinks.sort((a, b) => {
+            const aPriority = this.linkPriority(a.url);
+            const bPriority = this.linkPriority(b.url);
+            return bPriority - aPriority;
+          });
+          queue.push(...newLinks);
         }
       } catch (err) {
         console.warn(`Failed to capture ${url}: ${err.message}`);
+      }
+    };
+
+    if (this.lightCrawl && this.crawlConcurrency > 1) {
+      // Discovery crawls capture pages concurrently — light snapshots carry
+      // no shared per-page state, so a small worker pool over the shared BFS
+      // queue is safe (visited/visitedPaths updates are synchronous) and
+      // dramatically faster on multi-page crawls.
+      const poolPages = [page];
+      for (let i = 1; i < this.crawlConcurrency; i++) {
+        poolPages.push(await context.newPage());
+      }
+      await Promise.all(poolPages.map(async (pg) => {
+        while (snapshots.length < pageCap) {
+          const entry = queue.shift();
+          if (!entry) break;
+          await processEntry(pg, entry);
+        }
+      }));
+    } else {
+      while (queue.length > 0 && snapshots.length < pageCap) {
+        await processEntry(page, queue.shift());
       }
     }
 
@@ -225,8 +302,9 @@ class Explorer {
       }
       if (ls) {
         await page.goto(this.targetUrl, { waitUntil: 'domcontentloaded', timeout: this.timeout });
+        // page.localStorage (§2) — direct WebStorage access, no evaluate bridge.
         for (const [key, value] of Object.entries(ls)) {
-          await page.evaluate(([k, v]) => window.localStorage.setItem(k, v), [key, value]);
+          await page.localStorage.setItem(key, value);
         }
       }
       return;
@@ -239,6 +317,84 @@ class Explorer {
       });
       return;
     }
+  }
+
+  /**
+   * Lightweight capture used by lightCrawl mode (registry building): records
+   * only what screen discovery needs — final URL, title, path, and outbound
+   * links. Skips the expensive captures (aria snapshots, CDP a11y tree,
+   * visibility tagging, disclosure discovery, forms/API/CAPTCHA capture)
+   * that the test pipeline needs but the registry discards.
+   */
+  async capturePageLight(page, url) {
+    // Same adaptive networkidle strategy as capturePage, with a shorter
+    // timeout — discovery only needs links rendered, not full network quiet.
+    const idleTimeout = parseInt(process.env.LIGHT_NETWORKIDLE_TIMEOUT || '5000', 10);
+    let navigated = false;
+    if (!this.networkIdleFailed) {
+      try {
+        await page.goto(url, { waitUntil: 'networkidle', timeout: idleTimeout });
+        navigated = true;
+      } catch (err) {
+        this.networkIdleFailed = true;
+        console.warn(`networkidle timed out for ${url} — using domcontentloaded for remaining pages`);
+      }
+    }
+    if (!navigated) {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: this.timeout });
+      } catch (err) {
+        // Last resort: some apps abort or replace navigation mid-load (SPA
+        // redirects, download handoffs). 'commit' succeeds once the response
+        // starts arriving, then the link-settle wait below gives client JS
+        // time to render.
+        console.warn(`domcontentloaded timed out for ${url}, retrying with commit: ${err.message.split('\n')[0]}`);
+        await page.goto(url, { waitUntil: 'commit', timeout: this.timeout });
+      }
+    }
+
+    // Wait for client-rendered anchors. SPAs attach links after DOM ready —
+    // first wait for at least one anchor, then poll until the link count is
+    // stable so late-hydrating navs/menus aren't missed (bounded so a
+    // continuously-re-rendering page can't stall the crawl).
+    await page.waitForSelector('a[href]', {
+      state: 'attached',
+      timeout: parseInt(process.env.LIGHT_LINK_WAIT || '4000', 10),
+    }).catch(() => {});
+    const settleCap = parseInt(process.env.LIGHT_LINK_SETTLE || '1500', 10);
+    const settleStart = Date.now();
+    let lastCount = -1;
+    while (Date.now() - settleStart < settleCap) {
+      const count = await page
+        .evaluate(() => document.querySelectorAll('a[href]').length)
+        .catch(() => -1);
+      if (count < 0 || count === lastCount) break;
+      lastCount = count;
+      await page.waitForTimeout(250);
+    }
+    await page.waitForTimeout(150);
+
+    const title = await page.title();
+    const currentUrl = page.url();
+    const path = new URL(currentUrl).pathname;
+    const links = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('a[href]'))
+        .map(a => a.href)
+        .filter(href => href.startsWith('http'))
+    );
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      try {
+        const frameLinks = await frame.evaluate(() =>
+          Array.from(document.querySelectorAll('a[href]'))
+            .map(a => a.href)
+            .filter(href => href.startsWith('http'))
+        );
+        links.push(...frameLinks);
+      } catch { /* frame detached — skip */ }
+    }
+
+    return { url: currentUrl, path, title, links };
   }
 
   async capturePage(page, url) {
@@ -315,10 +471,26 @@ class Explorer {
       await page.waitForTimeout(300);
     }
 
+    // Capture AI-mode aria snapshot (§1) — YAML with stable [ref=eN] element
+    // references and [box=x,y,w,h] bounding boxes. This feeds LLM prompts
+    // instead of the flattened role+name lists (40–70% fewer input tokens),
+    // and provides deterministic visibility tagging without a per-element
+    // locator pass.
+    const ariaDepth = parseInt(process.env.ARIA_SNAPSHOT_DEPTH || '0', 10);
+    const ariaYaml = await captureAriaSnapshot(page, ariaDepth > 0 ? { depth: ariaDepth } : {});
+    // PW 1.63: structured JSON capture (refs/boxes/link urls) with YAML-parse
+    // fallback on older Playwright.
+    const ariaRefs = await captureAriaElements(page, ariaYaml);
+    // Default-mode snapshot — used as the toMatchAriaSnapshot() baseline in
+    // the deterministic Accessibility spec (no ref/box annotations).
+    const ariaBaseline = ariaYaml ? await captureAriaBaseline(page) : null;
+
     // Capture accessibility snapshot via CDP (page.accessibility was removed in newer Playwright)
     const accessibilityTree = await captureAccessibilityTree(page);
 
-    // Capture accessibility trees from iframes (for apps with embedded content)
+    // Capture accessibility trees from iframes (for apps with embedded content).
+    // The ai-mode ariaSnapshot does traverse same-origin iframes, but we keep
+    // the CDP capture as a fallback for any it misses.
     const iframeTrees = await captureIframeAccessibilityTrees(page);
 
     // Capture all visible role-name pairs from the main page
@@ -339,14 +511,20 @@ class Explorer {
     // captures ALL elements in the DOM regardless of whether they're visible
     // (e.g. spinbuttons inside a collapsed date/time picker). Without this
     // flag, the Planner generates tests that assert hidden elements as
-    // visible, causing false failures. We check visibility via the DOM:
-    // an element is "visible" if it has non-zero size, is not display:none,
-    // and is not visibility:hidden.
+    // visible, causing false failures.
     //
-    // We match elements by role+name using Playwright locators (the same
-    // mechanism the generated tests use), so the visibility flag reflects
-    // what the test will actually see at runtime.
-    await this.tagVisibility(page, roleNamePairs);
+    // Prefer the deterministic signal from aria-snapshot bounding boxes:
+    // a zero-size box = not rendered. For elements the snapshot didn't cover
+    // (or when the snapshot capture failed), fall back to the per-element
+    // locator check — the same mechanism generated tests use.
+    let visibilityChecked = new Set();
+    if (ariaRefs.length > 0) {
+      visibilityChecked = tagVisibilityFromSnapshot(ariaRefs, roleNamePairs);
+    }
+    const unchecked = roleNamePairs.filter(p => !visibilityChecked.has(p));
+    if (unchecked.length > 0) {
+      await this.tagVisibility(page, unchecked);
+    }
 
     // Capture page metadata
     const title = await page.title();
@@ -359,27 +537,39 @@ class Explorer {
     const apiSummary = summarizeApiCalls(apiCalls);
     tracker.detach();
 
-    // Discover links on the page (including links inside iframes)
-    const links = await page.evaluate(() => {
-      const allLinks = Array.from(document.querySelectorAll('a[href]'))
-        .map(a => a.href)
-        .filter(href => href.startsWith('http'));
-      // Also collect links from iframes (same-origin only)
-      for (const iframe of document.querySelectorAll('iframe')) {
-        try {
-          const doc = iframe.contentDocument;
-          if (doc) {
-            for (const a of doc.querySelectorAll('a[href]')) {
-              if (a.href.startsWith('http')) allLinks.push(a.href);
-            }
-          }
-        } catch { /* cross-origin iframe — skip */ }
-      }
-      return allLinks;
-    });
+    // Deterministic failure signals (§2): JS page errors and console errors
+    // observed during this page's load. The Planner/Healer uses these instead
+    // of letting the LLM infer failure modes.
+    const pageErrors = await page.pageErrors({ filter: 'since-navigation' })
+      .catch(() => []);
+    const consoleErrors = await page.consoleMessages({ filter: 'since-navigation' })
+      .then(msgs => msgs.filter(m => m.type() === 'error').map(m => m.text()))
+      .catch(() => []);
 
-    // Capture forms (including forms inside same-origin iframes)
-    const forms = await page.evaluate(() => {
+    // Discover links on the page (including links inside iframes).
+    // frame.evaluate() pierces the same-origin policy — it works in
+    // cross-origin frames where iframe.contentDocument returns null.
+    const links = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('a[href]'))
+        .map(a => a.href)
+        .filter(href => href.startsWith('http'))
+    );
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      try {
+        const frameLinks = await frame.evaluate(() =>
+          Array.from(document.querySelectorAll('a[href]'))
+            .map(a => a.href)
+            .filter(href => href.startsWith('http'))
+        );
+        links.push(...frameLinks);
+      } catch { /* frame detached — skip */ }
+    }
+
+    // Capture forms — including inside cross-origin iframes. frame.evaluate
+    // works in any frame (unlike iframe.contentDocument which is null for
+    // cross-origin), so embedded payment/booking widgets are captured too.
+    const captureFormsScript = () => {
       const captureForm = (form) => ({
         action: form.action,
         method: form.method,
@@ -391,21 +581,39 @@ class Explorer {
           ariaLabel: el.getAttribute('aria-label'),
         })),
       });
+      return Array.from(document.querySelectorAll('form')).map(captureForm);
+    };
+    const forms = await page.evaluate(captureFormsScript);
+    for (const frame of page.frames()) {
+      if (frame === page.mainFrame()) continue;
+      try {
+        const frameForms = await frame.evaluate(captureFormsScript);
+        forms.push(...frameForms);
+      } catch { /* frame detached — skip */ }
+    }
 
-      const allForms = Array.from(document.querySelectorAll('form')).map(captureForm);
-      // Also capture forms from same-origin iframes
-      for (const iframe of document.querySelectorAll('iframe')) {
-        try {
-          const doc = iframe.contentDocument;
-          if (doc) {
-            for (const form of doc.querySelectorAll('form')) {
-              allForms.push(captureForm(form));
-            }
-          }
-        } catch { /* cross-origin iframe — skip */ }
-      }
-      return allForms;
-    });
+    // CAPTCHA detection — cannot be automated (by design), but must be
+    // surfaced honestly: generated specs mark affected flows test.fixme
+    // rather than producing flaky failures or silent gaps.
+    const captchaDetected = await page.evaluate(() =>
+      !!document.querySelector(
+        'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], ' +
+        'iframe[src*="challenges.cloudflare"], iframe[src*="arkoselabs"], ' +
+        '.g-recaptcha, .h-captcha, .cf-turnstile, [data-sitekey]'
+      )
+    ).catch(() => false);
+
+    // Interactive disclosure discovery (§2): expand collapsed menus, popups,
+    // and accordions so elements that only exist inside them enter the page
+    // model. Without this, submenu items and popup-only components are
+    // invisible to the Planner — a significant coverage gap on apps with
+    // dropdown navigation, expandable filters, or disclosure widgets.
+    // Runs AFTER links/forms capture (rest state) so open menus don't
+    // pollute them; runs before interactiveElements so revealed menuitems
+    // are included. Revealed elements are tagged `revealedBy` +
+    // visible:false (hidden at rest) so deterministic suites ignore them
+    // while the Functional planner can plan trigger→item sequences.
+    await this.discoverDisclosureContent(page, roleNamePairs);
 
     // Capture interactive elements via accessibility tree
     // Include spinbutton (date/time picker inputs) so the Planner can generate
@@ -416,12 +624,17 @@ class Explorer {
       ['button', 'link', 'textbox', 'checkbox', 'radio', 'combobox', 'searchbox', 'tab', 'menuitem', 'switch', 'spinbutton'].includes(e.role)
     );
 
-    return {
+    const snapshot = {
       url: currentUrl,
       path,
       title,
       accessibilityTree,
       iframeTrees,
+      ariaYaml,
+      ariaBaseline,
+      ariaRefs,
+      pageErrors: pageErrors.map(e => String(e && e.message || e)).slice(0, 20),
+      consoleErrors: consoleErrors.slice(0, 20),
       roleNamePairs,
       interactiveElements,
       links,
@@ -430,9 +643,14 @@ class Explorer {
       // waitForResponse() instead of fixed sleeps for SPA/API-Gateway apps.
       apiCalls,
       apiSummary,
+      captchaDetected,
       isSpa: usedFallback || apiCalls.length > 0,
       timestamp: new Date().toISOString(),
     };
+    // Content hash of the page structure — used for cross-run spec caching
+    // (§9). Unchanged pages can reuse previously generated specs at ~0 tokens.
+    snapshot.ariaHash = snapshotContentHash(snapshot);
+    return snapshot;
   }
 
   extractRoleNamePairs(node, pairs = []) {
@@ -502,10 +720,100 @@ class Explorer {
     }
   }
 
+  /**
+   * Expand collapsed disclosure widgets (menus, popups, accordions) and
+   * merge newly-revealed elements into `roleNamePairs`, tagged with
+   * `revealedBy` (trigger label) and `visible: false` (hidden at rest —
+   * deterministic suites ignore them; the Functional planner plans
+   * trigger→item sequences).
+   *
+   * The page clock is resumed during discovery because menu/popup open
+   * handlers are frequently driven by setTimeout/requestAnimationFrame,
+   * which never fire while the clock is paused — then re-paused at the
+   * fixed instant so subsequent captures stay deterministic.
+   */
+  async discoverDisclosureContent(page, roleNamePairs) {
+    const MAX_TRIGGERS = parseInt(process.env.MAX_DISCLOSURE_TRIGGERS || '10', 10);
+    const MAX_REVEALED = 60;
+    const urlBefore = page.url();
+    const known = new Set(roleNamePairs.map(p => `${p.role}|${p.name}`));
+    let added = 0;
+
+    // Resume the clock so timer-driven reveal handlers can run.
+    try { await page.clock.resume(); } catch { /* clock not installed */ }
+
+    try {
+      const triggers = await page.$$(
+        '[aria-expanded="false"], [aria-haspopup]:not([aria-expanded="true"]), details:not([open]) > summary'
+      );
+      for (const trigger of triggers.slice(0, MAX_TRIGGERS)) {
+        if (added >= MAX_REVEALED) break;
+        try {
+          if (!(await trigger.isVisible().catch(() => false))) continue;
+          const label = (
+            (await trigger.getAttribute('aria-label').catch(() => null)) ||
+            (await trigger.innerText().catch(() => '')).trim() ||
+            'disclosure'
+          ).slice(0, 60);
+          // Hover first with a dwell — hover-intent menus open after a
+          // ~300-500ms delay. Capture after hover (covers menus that a
+          // click would close again), then click for click-disclosure
+          // widgets and capture a second time.
+          const mergeFresh = async () => {
+            const fresh = await captureAriaElements(page, null);
+            for (const p of fresh) {
+              if (!p.name || added >= MAX_REVEALED) break;
+              const key = `${p.role}|${p.name}`;
+              if (known.has(key)) continue;
+              known.add(key);
+              roleNamePairs.push({
+                role: p.role,
+                name: p.name,
+                focused: false,
+                disabled: false,
+                // Truthful at REST: the element is not rendered until its
+                // trigger opens the disclosure. Deterministic suites filter
+                // on visible===false; functional steps get the catch-wrap
+                // treatment (waitFor-visible then click) which still works
+                // once the trigger step has opened the menu.
+                visible: false,
+                revealedBy: label,
+              });
+              added++;
+            }
+          };
+          await trigger.hover({ timeout: 2000 }).catch(() => {});
+          await page.waitForTimeout(500);
+          await mergeFresh();
+          await trigger.click({ timeout: 3000 }).catch(() => {});
+          await page.waitForTimeout(400);
+          // A trigger that navigated (plain link styled as a menu) poisons
+          // discovery — go back and stop.
+          if (page.url() !== urlBefore) {
+            await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+            await page.waitForTimeout(500);
+            break;
+          }
+          await mergeFresh();
+          // Close the disclosure before probing the next trigger.
+          await page.keyboard.press('Escape').catch(() => {});
+          await page.waitForTimeout(150);
+        } catch { /* non-fatal — continue with the next trigger */ }
+      }
+    } finally {
+      // Restore the frozen clock so later captures stay deterministic.
+      try { await page.clock.pauseAt(new Date(FIXED_CLOCK_TIME)); } catch { /* not installed */ }
+    }
+    return added;
+  }
+
   normalizeUrl(url) {
     try {
       const u = new URL(url, this.targetUrl);
-      u.hash = '';
+      // Keep hash-router routes (#/path, #!/path) — they are distinct screens
+      // in hash-based SPAs. Strip plain anchor fragments and the bare home
+      // route (#, #/) which only scroll or alias the root page.
+      if (!/^#!?\/.+/.test(u.hash)) u.hash = '';
       return u.toString().replace(/\/+$/, '');
     } catch {
       return url;
@@ -538,8 +846,9 @@ class Explorer {
       if (/(facebook|twitter|x\.com|linkedin|instagram|youtube|tiktok|pinterest|github\.com|mailto:|tel:)/i.test(url)) return true;
       // Common non-interactive legal/help pages (low test value)
       if (/(privacy-policy|terms-of-service|terms-and-conditions|cookie-policy|accessibility-statement|help-center|faq)$/i.test(u.pathname)) return true;
-      // Anchors with no path change
-      if (u.pathname === '/' && u.hash) return true;
+      // Anchors with no path change — but keep hash-router routes (#/...),
+      // which are real screens in hash-based SPAs despite living on '/'.
+      if (u.pathname === '/' && u.hash && !/^#!?\/.+/.test(u.hash)) return true;
       return false;
     } catch {
       return true;

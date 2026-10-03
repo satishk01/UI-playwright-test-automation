@@ -76,6 +76,10 @@ router.post('/build', async (req, res) => {
       storageStatePath: null,
       appContext: cleanAppContext,
       apiPatterns: cleanAppContext.apiPatterns || null,
+      // Registry building only needs screen discovery (URL + title + links),
+      // not the full page model the test pipeline consumes — lightCrawl skips
+      // the heavy per-page captures and walks pages concurrently.
+      lightCrawl: true,
     });
 
     const snapshots = await explorer.explore();

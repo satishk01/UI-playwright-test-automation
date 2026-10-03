@@ -44,8 +44,7 @@ Autonomous E2E test generation pipeline with 9 LLM providers: explore a site, pl
 ## Quick Start
 
 ```bash
-git clone <your-repository-url>
-cd UI-playwright-test-automation
+unzip autotest-agent.zip && cd autotest-agent
 npm install && cd client && npm install && cd ..
 npx playwright install chromium
 cp .env.example .env          # edit with your provider config

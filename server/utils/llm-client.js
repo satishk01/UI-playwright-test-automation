@@ -149,29 +149,47 @@ class LLMClient {
 
   // ── Public API ────────────────────────────────────────────
 
+  /**
+   * @param {string} prompt
+   * @param {object} [options]
+   * @param {number} [options.maxTokens]
+   * @param {string} [options.system] — static system prompt; when `cache` is
+   *   set it is marked for provider prompt caching (§9) so repeated calls
+   *   with the same prefix bill cached input at ~10%.
+   * @param {boolean} [options.cache] — enable prompt caching for `system`
+   *   (Anthropic cache_control, Bedrock cachePoint).
+   * @param {boolean} [options.json] — request structured JSON output
+   *   (§9): OpenAI-compatible response_format, Anthropic/Bedrock forced
+   *   tool-use. Eliminates extractJSON parse failures and fallback re-calls.
+   * @param {object} [options.jsonSchema] — JSON schema for the response;
+   *   defaults to a permissive object schema when `json` is set.
+   */
   async complete(prompt, options = {}) {
     const maxTokens = options.maxTokens || 4096;
     const system = options.system || undefined;
+    const cache = options.cache === true;
+    const json = options.json === true;
+    const jsonSchema = options.jsonSchema || null;
 
     let text;
     switch (this.provider) {
       case 'anthropic':
-        text = await this._completeAnthropic(prompt, maxTokens, system);
+        text = await this._completeAnthropic(prompt, maxTokens, system, { cache, json, jsonSchema });
         break;
       case 'bedrock':
         if (this.awsApiKey && this.awsBaseUrl) {
           // API Key + custom base URL — use OpenAI-compatible format via proxy
-          text = await this._completeBedrockViaProxy(prompt, maxTokens, system);
+          text = await this._completeBedrockViaProxy(prompt, maxTokens, system, { json });
         } else {
-          text = await this._completeBedrock(prompt, maxTokens, system);
+          text = await this._completeBedrock(prompt, maxTokens, system, { cache, json, jsonSchema });
         }
         break;
       case 'azure':
-        text = await this._completeAzure(prompt, maxTokens, system);
+        text = await this._completeAzure(prompt, maxTokens, system, { json, jsonSchema });
         break;
       default:
         if (OPENAI_COMPAT_PROVIDERS.has(this.provider)) {
-          text = await this._completeOpenAI(prompt, maxTokens, system);
+          text = await this._completeOpenAI(prompt, maxTokens, system, { json });
           break;
         }
         throw new Error(`Unknown provider: ${this.provider}`);
@@ -254,13 +272,30 @@ class LLMClient {
 
   // ── Anthropic (native SDK) ────────────────────────────────
 
-  async _completeAnthropic(prompt, maxTokens, system) {
+  async _completeAnthropic(prompt, maxTokens, system, opts = {}) {
     const params = {
       model: this.model,
       max_tokens: maxTokens,
       messages: [{ role: 'user', content: prompt }],
     };
-    if (system) params.system = system;
+    if (system) {
+      // §9 prompt caching: a cached system prefix bills ~10% on repeat calls
+      // (rules block, element list — resent to heal across iterations).
+      params.system = opts.cache
+        ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+        : system;
+    }
+    if (opts.json) {
+      // §9 structured output: force a tool call so the response is
+      // guaranteed-valid JSON — no extractJSON fallback re-call needed.
+      const schema = opts.jsonSchema || { type: 'object' };
+      params.tools = [{
+        name: 'emit_result',
+        description: 'Return the requested structured result as JSON.',
+        input_schema: schema,
+      }];
+      params.tool_choice = { type: 'tool', name: 'emit_result' };
+    }
 
     const response = await this._anthropic.messages.create(params);
     // Anthropic returns usage.input_tokens / usage.output_tokens
@@ -268,12 +303,16 @@ class LLMClient {
       this.usage.inputTokens += response.usage.input_tokens || 0;
       this.usage.outputTokens += response.usage.output_tokens || 0;
     }
+    if (opts.json) {
+      const toolUse = (response.content || []).find(b => b.type === 'tool_use');
+      if (toolUse) return JSON.stringify(toolUse.input);
+    }
     return response.content.filter(b => b.type === 'text').map(b => b.text).join('');
   }
 
   // ── AWS Bedrock (Converse API) ────────────────────────────
 
-  async _completeBedrock(prompt, maxTokens, system) {
+  async _completeBedrock(prompt, maxTokens, system, opts = {}) {
     const params = {
       modelId: this.model,
       messages: [
@@ -286,12 +325,31 @@ class LLMClient {
     };
 
     if (system) {
-      params.system = [{ text: system }];
+      // §9 prompt caching — Bedrock cachePoint marks the end of the
+      // cacheable prefix.
+      params.system = opts.cache
+        ? [{ text: system }, { cachePoint: { type: 'default' } }]
+        : [{ text: system }];
+    }
+
+    if (opts.json) {
+      // §9 structured output via forced tool-use on Converse.
+      const schema = opts.jsonSchema || { type: 'object' };
+      params.toolConfig = {
+        tools: [{
+          toolSpec: {
+            name: 'emit_result',
+            description: 'Return the requested structured result as JSON.',
+            inputSchema: { json: schema },
+          },
+        }],
+        toolChoice: { tool: { name: 'emit_result' } },
+      };
     }
 
     if (this.awsApiKey) {
       // API Key mode — direct HTTP fetch to Bedrock Converse API with Bearer token
-      return this._completeBedrockWithApiKey(params);
+      return this._completeBedrockWithApiKey(params, opts);
     }
 
     const command = new ConverseCommand(params);
@@ -308,10 +366,14 @@ class LLMClient {
     if (!content || content.length === 0) {
       throw new Error('Bedrock returned empty response');
     }
+    if (opts.json) {
+      const toolUse = content.find(b => b.toolUse);
+      if (toolUse) return JSON.stringify(toolUse.toolUse.input);
+    }
     return content.map(block => block.text || '').join('');
   }
 
-  async _completeBedrockWithApiKey(params) {
+  async _completeBedrockWithApiKey(params, opts = {}) {
     // Use the Bedrock Converse API REST endpoint with Bearer token auth
     const region = this.awsRegion;
     const modelId = encodeURIComponent(params.modelId);
@@ -338,16 +400,19 @@ class LLMClient {
       this.usage.inputTokens += data.usage.inputTokens || 0;
       this.usage.outputTokens += data.usage.outputTokens || 0;
     }
-    this.usage.calls++;
 
     const content = data.output?.message?.content;
     if (!content || content.length === 0) {
       throw new Error('Bedrock returned empty response');
     }
+    if (opts.json) {
+      const toolUse = content.find(b => b.toolUse);
+      if (toolUse) return JSON.stringify(toolUse.toolUse.input);
+    }
     return content.map(block => block.text || '').join('');
   }
 
-  async _completeBedrockViaProxy(prompt, maxTokens, system) {
+  async _completeBedrockViaProxy(prompt, maxTokens, system, opts = {}) {
     // OpenAI-compatible format for Bedrock proxies (e.g. LiteLLM)
     // Uses /v1/chat/completions with Bearer token auth
     const messages = [];
@@ -364,6 +429,9 @@ class LLMClient {
       temperature: 0.2,
       stream: false,
     };
+    if (opts.json) {
+      body.response_format = { type: 'json_object' };
+    }
 
     const response = await fetch(url, {
       method: 'POST',
@@ -397,10 +465,7 @@ class LLMClient {
           if (delta) content += delta;
         } catch { /* skip malformed chunks */ }
       }
-      if (content) {
-        this.usage.calls++;
-        return content;
-      }
+      if (content) return content;
     }
 
     const data = JSON.parse(raw);
@@ -409,7 +474,6 @@ class LLMClient {
       this.usage.inputTokens += data.usage.prompt_tokens || 0;
       this.usage.outputTokens += data.usage.completion_tokens || 0;
     }
-    this.usage.calls++;
 
     const content = data.choices?.[0]?.message?.content;
     if (!content) {
@@ -425,7 +489,7 @@ class LLMClient {
 
   // ── Azure OpenAI ──────────────────────────────────────────
 
-  async _completeAzure(prompt, maxTokens, system) {
+  async _completeAzure(prompt, maxTokens, system, opts = {}) {
     if (!this.baseUrl) {
       throw new Error('Azure requires baseUrl: https://{resource}.openai.azure.com');
     }
@@ -437,17 +501,25 @@ class LLMClient {
     const base = this.baseUrl.replace(/\/+$/, '');
     const url = `${base}/openai/deployments/${encodeURIComponent(this.azureDeployment)}/chat/completions?api-version=${this.azureApiVersion}`;
 
+    const body = {
+      messages,
+      max_tokens: maxTokens,
+      temperature: 0.2,
+    };
+    if (opts.json) {
+      // §9 structured output — JSON mode on Azure OpenAI chat completions.
+      body.response_format = opts.jsonSchema
+        ? { type: 'json_schema', json_schema: { name: 'result', schema: opts.jsonSchema } }
+        : { type: 'json_object' };
+    }
+
     const response = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'api-key': this.apiKey,
       },
-      body: JSON.stringify({
-        messages,
-        max_tokens: maxTokens,
-        temperature: 0.2,
-      }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {
@@ -469,7 +541,7 @@ class LLMClient {
 
   // ── OpenAI-compatible (Ollama/vLLM/NVIDIA/OpenRouter/Grok/OmniRoute) ──
 
-  async _completeOpenAI(prompt, maxTokens, system) {
+  async _completeOpenAI(prompt, maxTokens, system, opts = {}) {
     const messages = [];
     if (system) messages.push({ role: 'system', content: system });
     messages.push({ role: 'user', content: prompt });
@@ -497,8 +569,16 @@ class LLMClient {
       stream: false,
     };
 
+    if (opts.json) {
+      // §9 structured output — JSON mode on OpenAI-compatible endpoints
+      // (vllm/openrouter/omniroute/ollama all accept response_format or
+      // fall through harmlessly if unsupported).
+      body.response_format = { type: 'json_object' };
+    }
+
     if (this.provider === 'ollama') {
       body.options = { num_predict: maxTokens };
+      if (opts.json) body.format = 'json';
     }
 
     const response = await fetch(url, {

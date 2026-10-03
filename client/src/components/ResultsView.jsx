@@ -38,6 +38,10 @@ export default function ResultsView({ runId, results, onNewRun, onReExecute }) {
             <div className="stat-label">Failed</div>
           </div>
           <div className="stat-card">
+            <div className="stat-value skipped">{results.skipped || 0}</div>
+            <div className="stat-label">Skipped</div>
+          </div>
+          <div className="stat-card">
             <div className="stat-value fixme">{results.fixme}</div>
             <div className="stat-label">Fixme</div>
           </div>
@@ -100,6 +104,7 @@ export default function ResultsView({ runId, results, onNewRun, onReExecute }) {
                 <div style={{ display: 'flex', gap: 12, fontSize: 13, fontFamily: 'var(--font-mono)' }}>
                   <span style={{ color: 'var(--success)' }}>{plan.passed}✓</span>
                   <span style={{ color: 'var(--error)' }}>{plan.failed}✗</span>
+                  {plan.skipped > 0 && <span style={{ color: 'var(--text-muted)' }}>{plan.skipped}⊘</span>}
                   {plan.fixme > 0 && <span style={{ color: 'var(--warning)' }}>{plan.fixme}⚠</span>}
                 </div>
               </div>

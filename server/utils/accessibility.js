@@ -139,13 +139,27 @@ async function captureIframeAccessibilityTrees(page) {
       );
 
       if (frame) {
-        // Capture the accessibility tree from within the iframe
-        const iframeClient = await page.context().newCDPSession(frame);
-        const { nodes } = await iframeClient.send('Accessibility.getFullAXTree');
-        await iframeClient.detach();
+        let tree = null;
+        try {
+          // Capture the accessibility tree from within the iframe
+          const iframeClient = await page.context().newCDPSession(frame);
+          const { nodes } = await iframeClient.send('Accessibility.getFullAXTree');
+          await iframeClient.detach();
 
-        // Build tree from iframe nodes (same logic as main tree)
-        const tree = buildTreeFromNodes(nodes);
+          // Build tree from iframe nodes (same logic as main tree)
+          tree = buildTreeFromNodes(nodes);
+        } catch (cdpErr) {
+          // Cross-origin frames reject CDP sessions — but Playwright CAN
+          // evaluate inside them. Fall back to an aria snapshot of the
+          // frame's body so embedded widgets (payment fields, embedded
+          // apps) still contribute elements to the page model. The tree
+          // is flattened (no nesting), which is sufficient for the
+          // role+name element list consumers use.
+          try {
+            const yaml = await frame.locator('body').ariaSnapshot({ timeout: 8000 });
+            tree = treeFromAriaYaml(yaml, iframe.title || iframe.src || 'iframe');
+          } catch { /* frame gone or empty — skip */ }
+        }
         if (tree) {
           iframeData.push({
             frameUrl: iframe.src,
@@ -216,6 +230,35 @@ function buildTreeFromNodes(nodes) {
   if (roots.length === 0) return null;
   const result = buildTree(roots[0].nodeId);
   return result.node || (result.children.length > 0 ? result.children[0] : null);
+}
+
+/**
+ * Build a synthetic accessibility tree from an ai-mode aria snapshot YAML.
+ * Used as the cross-origin iframe fallback: frames reject CDP sessions, but
+ * `frame.locator('body').ariaSnapshot()` pierces the origin boundary.
+ * Produces a flat tree — root WebArea with element children — sufficient
+ * for the role+name pair extraction consumers perform.
+ * @param {string} yaml
+ * @param {string} frameName
+ * @returns {object|null}
+ */
+function treeFromAriaYaml(yaml, frameName) {
+  if (!yaml) return null;
+  const { parseAriaRefs } = require('./aria-snapshot');
+  const elements = parseAriaRefs(yaml).filter(e => e.name);
+  if (elements.length === 0) return null;
+  return {
+    role: 'WebArea',
+    name: frameName,
+    focused: false,
+    children: elements.map(e => ({
+      role: e.role,
+      name: e.name,
+      focused: false,
+      disabled: false,
+      children: [],
+    })),
+  };
 }
 
 module.exports = { captureAccessibilityTree, captureIframeAccessibilityTrees };

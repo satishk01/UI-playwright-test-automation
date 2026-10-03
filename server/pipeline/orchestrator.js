@@ -7,6 +7,7 @@ const { Generator } = require('./04_generate');
 const { Executor } = require('./05_execute');
 const { Healer } = require('./06_heal');
 const { createLLMClient } = require('../utils/llm-client');
+const specCache = require('../utils/spec-cache');
 
 class PipelineOrchestrator {
   constructor(run, send) {
@@ -69,7 +70,7 @@ class PipelineOrchestrator {
     this.emit('pipeline', 'info', { message: `LLM provider: ${llm.describe()}` });
 
     const maxHealIterations = parseInt(process.env.MAX_HEAL_ITERATIONS || '3', 10);
-    let finalResults = { plans: [], totalTests: 0, passed: 0, failed: 0, fixme: 0 };
+    let finalResults = { plans: [], totalTests: 0, passed: 0, failed: 0, skipped: 0, fixme: 0 };
     // Token usage accumulator — populated from each stage's LLM client
     let tokenUsage = { inputTokens: 0, outputTokens: 0, calls: 0, stages: {} };
 
@@ -105,7 +106,7 @@ class PipelineOrchestrator {
       }
 
       // ── Stage 2: Analyze ──
-      this.emit('analyze', 'running', { message: 'Building page models via LLM...' });
+      this.emit('analyze', 'running', { message: 'Building page models...' });
       const analyzer = new Analyzer(this.llmConfig, this.description);
       const pageModels = await analyzer.analyze(snapshots);
       if (this.aborted) throw new Error('Aborted');
@@ -119,7 +120,20 @@ class PipelineOrchestrator {
       // ── Stage 3: Plan ──
       this.emit('plan', 'running', { message: 'Generating test scenarios...' });
       const planner = new Planner(this.llmConfig, this.description);
-      const plans = await planner.plan(pageModels, snapshots);
+      // §9 cross-run caching: pages whose Functional spec is already cached
+      // don't need the Functional-planning LLM call at all.
+      const specCacheEnabled = this.runData.options?.specCache !== false && process.env.SPEC_CACHE_DISABLE !== '1';
+      const skipFunctionalPages = specCacheEnabled
+        ? new Set(
+            pageModels
+              .map(m => m.url)
+              .filter(url => {
+                const snap = snapshots.find(s => s.url === url);
+                return snap && specCache.cachedSuites(snap).includes('Functional');
+              })
+          )
+        : null;
+      const plans = await planner.plan(pageModels, snapshots, { skipFunctionalPages });
       if (this.aborted) throw new Error('Aborted');
       tokenUsage.stages.plan = planner.getUsage();
       fs.writeFileSync(
@@ -142,6 +156,12 @@ class PipelineOrchestrator {
         apiPatterns: this.appContext.apiPatterns || null,
         appContext: this.appContext,
         testTimeout: this.runData.options?.testTimeout || null,
+        knowledgeDir: this.knowledgeDir,
+        generatedTestsDir: this.testsDir,
+        // §8: emit test.abort() in specs when auth was configured — a missing
+        // auth-state file means every step is doomed.
+        authStateRelPath: (this.runData.auth && this.runData.auth.type && this.runData.auth.type !== 'none')
+          ? 'auth-state.json' : null,
       });
       const executor = new Executor(this.testsDir, this.resultsDir, {
         storageStatePath: this.storageStatePath,
@@ -165,10 +185,36 @@ class PipelineOrchestrator {
 
         const snapshot = snapshots.find(s => s.url === plan.page || s.path === plan.page) || snapshots[0];
 
-        let testCode = await generator.generate(plan, snapshot);
+        // §9: reuse a cached spec when the page snapshot is unchanged since
+        // the last run — zero tokens and zero recorder time.
+        const cached = specCacheEnabled ? specCache.get(snapshot) : null;
+        const cachedSuite = cached && cached.suites[plan.suite];
+
+        let testCode;
+        if (cachedSuite) {
+          testCode = cachedSuite.code;
+          // Copy the recorded HAR (if any) into this run's knowledge dir so
+          // routeFromHAR in the cached spec resolves.
+          if (cachedSuite.har && fs.existsSync(cachedSuite.har)) {
+            try { fs.copyFileSync(cachedSuite.har, path.join(this.knowledgeDir, `${planId}.har`)); } catch {}
+          }
+          // A cached Accessibility spec still needs its aria baseline in this
+          // run's tests dir.
+          if (plan.suite === 'Accessibility') {
+            generator.writeA11yBaseline(plan, snapshot);
+          }
+          this.emit('generate', 'done', { planId, message: `${planId} — reused cached spec (0 tokens)` });
+        } else {
+          testCode = await generator.generate(plan, snapshot);
+          if (specCacheEnabled && testCode) {
+            const harAbs = path.join(this.knowledgeDir, `${planId}.har`);
+            specCache.set(snapshot, plan.suite, testCode, fs.existsSync(harAbs) ? harAbs : null);
+          }
+          this.emit('generate', 'done', { planId });
+        }
+
         const specFile = path.join(this.testsDir, `${planId}.spec.ts`);
         fs.writeFileSync(specFile, testCode);
-        this.emit('generate', 'done', { planId });
 
         specFiles.push(specFile);
         planSpecMap.set(plan, { specFile, planId, testCode });
@@ -234,12 +280,14 @@ class PipelineOrchestrator {
             tests: result.total,
             passed: result.passed,
             failed: result.failed,
+            skipped: result.skipped || 0,
             fixme: (testCode.match(/test\.fixme/g) || []).length,
           };
           finalResults.plans.push(planResult);
           finalResults.totalTests += planResult.tests;
           finalResults.passed += planResult.passed;
           finalResults.failed += planResult.failed;
+          finalResults.skipped += planResult.skipped;
           finalResults.fixme += planResult.fixme;
         }
       } else {
@@ -250,6 +298,7 @@ class PipelineOrchestrator {
           let testCode = initialCode;
           let iteration = 0;
           let bestResult = null;
+          let lastFailures = null;
 
           const snapshot = snapshots.find(s => s.url === plan.page || s.path === plan.page) || snapshots[0];
 
@@ -258,14 +307,28 @@ class PipelineOrchestrator {
             iteration++;
 
             this.emit('execute', 'running', { planId, iteration, message: `Executing: ${planId} (attempt ${iteration})` });
-            const result = await executor.execute(specFile);
+            // §8: on heal iterations, re-run only the tests that failed last
+            // time (--test-list) instead of the whole spec — faster loops,
+            // less environment noise.
+            const result = await executor.execute(specFile, { onlyFailures: iteration > 1 ? lastFailures : null });
+            // A --test-list re-run only covers the previously failed tests —
+            // merge it into the last full result so reporting stays whole.
+            if (iteration > 1 && lastFailures && bestResult && result.total > 0 && result.total < bestResult.total) {
+              result.passed = bestResult.passed + result.passed;
+              result.skipped = (bestResult.skipped || 0) + (result.skipped || 0);
+              result.total = bestResult.total;
+            }
             this.emit('execute', 'done', { planId, iteration, ...result });
+            lastFailures = result.failures;
 
             if (!bestResult || this.isImprovement(result, bestResult)) {
               bestResult = result;
+              // Track which spec source produced the best result so a
+              // non-improving heal below can restore it.
+              bestResult.code = testCode;
             }
 
-            if (result.passed === result.total && result.compileErrors === 0) break;
+            if (result.passed === result.total && result.total > 0 && result.compileErrors === 0) break;
 
             if (iteration >= maxHealIterations) {
               this.emit('heal', 'escalate', { planId, message: 'Max iterations reached, marking failures as fixme' });
@@ -275,7 +338,7 @@ class PipelineOrchestrator {
             }
 
             this.emit('heal', 'running', { planId, iteration, message: `Healing: ${planId}` });
-            const healed = await healer.heal(testCode, result, snapshot, plan);
+            const healed = await healer.heal(testCode, result, snapshot, plan, { harRelPath: this._harRelPath(planId) });
 
             if (healed && this.isImprovement(healed.expectedResult, bestResult)) {
               testCode = healed.code;
@@ -297,12 +360,14 @@ class PipelineOrchestrator {
             tests: bestResult ? bestResult.total : 0,
             passed: bestResult ? bestResult.passed : 0,
             failed: bestResult ? bestResult.failed : 0,
+            skipped: bestResult ? (bestResult.skipped || 0) : 0,
             fixme: (testCode.match(/test\.fixme/g) || []).length,
           };
           finalResults.plans.push(planResult);
           finalResults.totalTests += planResult.tests;
           finalResults.passed += planResult.passed;
           finalResults.failed += planResult.failed;
+          finalResults.skipped += planResult.skipped;
           finalResults.fixme += planResult.fixme;
         }
       }
@@ -352,6 +417,15 @@ class PipelineOrchestrator {
       }
       throw err;
     }
+  }
+
+  /**
+   * Spec-relative HAR path for a plan (§3) — null when no HAR was recorded.
+   * Emitted as `path.join(__dirname, '<rel>')` inside generated specs.
+   */
+  _harRelPath(planId) {
+    const harAbs = path.join(this.knowledgeDir, `${planId}.har`);
+    return fs.existsSync(harAbs) ? `../knowledge/${planId}.har` : null;
   }
 
   isImprovement(candidate, baseline) {

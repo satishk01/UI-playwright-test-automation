@@ -38,6 +38,10 @@ function buildPlaywrightConfig(opts = {}) {
     "    headless: true,",
     "    screenshot: 'only-on-failure',",
     "    trace: 'retain-on-failure',",
+    // Flake-class killers (§8): service workers cache stale assets and CSS
+    // animations race assertions — disable both deterministically.
+    "    serviceWorkers: 'block',",
+    "    reducedMotion: 'reduce',",
   ];
 
   // Storage state — JSON.stringify escapes any path separators / quotes.
@@ -72,14 +76,26 @@ function buildPlaywrightConfig(opts = {}) {
     useOptions.push(`    userAgent: ${JSON.stringify(appContext.userAgent)},`);
   }
 
+  // Locale — must match the explorer/recorder contexts or locale-sensitive
+  // rendering (toLocaleDateString etc.) produces false baseline diffs.
+  const locale = (typeof appContext.locale === 'string' && appContext.locale.trim())
+    ? appContext.locale.trim() : 'en-US';
+  useOptions.push(`    locale: ${JSON.stringify(locale)},`);
+
   return `import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './generated-tests',
   timeout: ${testTimeout},
   retries: ${retries},
+  // §8: retries run in a clean worker — separates real failures from
+  // cross-test interference flakes.
+  ${retries > 0 ? "retryStrategy: 'isolated'," : ''}
   fullyParallel: true,
   workers: 4,
+  // snapshotDir resolves relative to THIS config file's dir (runDir), not
+  // testDir — so './screenshots' lands at runDir/screenshots where
+  // writeA11yBaseline and the visual-test guards place baselines.
   snapshotDir: './screenshots',
   updateSnapshots: 'missing',
   use: {
@@ -179,6 +195,9 @@ class Executor {
       // We do NOT pass --reporter on CLI because that overrides the config's reporters,
       // and the PLAYWRIGHT_JSON_OUTPUT_NAME env var does not work in this Playwright version.
       const allResultsFile = path.join(this.resultsDir, 'all-results.json');
+      // Clear stale results — if this playwright run produces nothing we must
+      // see that as "no results", not inherit the previous spec's file.
+      try { fs.unlinkSync(allResultsFile); } catch {}
 
       await new Promise((resolve) => {
         const child = spawn('npx', [
@@ -281,7 +300,11 @@ class Executor {
    */
   _parseReportInto(report, result, planId) {
     const tests = [];
-    const walk = (suite) => {
+    // titlePath accumulates describe-suite titles so a test can be targeted
+    // via `npx playwright test --test-list` (§8 — re-run only failed tests
+    // in the heal loop instead of the whole spec).
+    const walk = (suite, titlePath) => {
+      const childTitles = suite.title && !suite.file ? [...titlePath, suite.title] : titlePath;
       if (suite.specs) {
         for (const spec of suite.specs) {
           const specFile = spec.file || suite.file;
@@ -297,10 +320,12 @@ class Executor {
             const screenshot = failResult.attachments?.find(a => a.name === 'screenshot')?.path || null;
             tests.push({
               name: spec.title,
+              titlePath: [...childTitles, spec.title],
               status: test.status,
               duration: testResults.reduce((sum, r) => sum + (r.duration || 0), 0),
               error: failResult.error?.message || null,
               snippet: failResult.error?.snippet || null,
+              errorContext: failResult.error?.errorContext || null,
               flaky,
               screenshot,
             });
@@ -308,12 +333,12 @@ class Executor {
         }
       }
       if (suite.suites) {
-        for (const child of suite.suites) walk(child);
+        for (const child of suite.suites) walk(child, childTitles);
       }
     };
 
     if (report.suites) {
-      for (const suite of report.suites) walk(suite);
+      for (const suite of report.suites) walk(suite, []);
     }
 
     result.total = tests.length;
@@ -325,8 +350,10 @@ class Executor {
       .filter(t => t.status === 'unexpected')
       .map(t => ({
         testName: t.name,
+        titlePath: t.titlePath,
         reason: t.error || 'Test failed',
         snippet: t.snippet,
+        errorContext: t.errorContext,
         type: 'test_failure',
         screenshot: t.screenshot,
       }));
@@ -425,7 +452,35 @@ class Executor {
     return byFile;
   }
 
-  async execute(specFile) {
+  /**
+   * Build a --test-list file (§8) so the heal loop re-runs only the failing
+   * tests instead of the whole spec per iteration.
+   * Format per line: `<specFile> › <describe title> › <test title>`.
+   * @param {string} specBasename — e.g. 'Home_Navigation.spec.ts'
+   * @param {Array} failures — failures with optional titlePath
+   * @returns {string|null} absolute path to the test-list file, or null if
+   *   no usable entries were produced.
+   */
+  _writeTestListFile(specBasename, failures) {
+    const lines = [];
+    for (const f of failures) {
+      if (f.type === 'compile_error') continue;
+      const titles = Array.isArray(f.titlePath) && f.titlePath.length > 0
+        ? f.titlePath
+        : [f.testName];
+      if (!titles.every(t => typeof t === 'string' && t.trim())) continue;
+      lines.push(`${specBasename} › ${titles.join(' › ')}`);
+    }
+    if (lines.length === 0) return null;
+    const listPath = path.join(
+      this.resultsDir,
+      `testlist-${path.basename(specBasename, '.spec.ts')}.txt`
+    );
+    fs.writeFileSync(listPath, lines.join('\n') + '\n');
+    return listPath;
+  }
+
+  async execute(specFile, opts = {}) {
     const result = {
       specFile,
       total: 0,
@@ -451,9 +506,25 @@ class Executor {
 
     // Step 2: Run with Playwright
     const resultsFile = path.join(this.resultsDir, `${path.basename(specFile, '.spec.ts')}-results.json`);
+    // Clear stale results from the previous run/spec BEFORE executing — if
+    // this playwright invocation produces nothing, parsing a leftover file
+    // would silently attribute another suite's results to this spec.
+    const allResultsFile0 = path.join(this.resultsDir, 'all-results.json');
+    try { fs.unlinkSync(allResultsFile0); } catch {}
+    try { fs.unlinkSync(resultsFile); } catch {}
     // The config sets testDir to './generated-tests', so rootDir becomes that
     // subdirectory. The filter argument must be relative to rootDir (just the filename).
     const specFilter = path.basename(specFile);
+
+    // §8: when caller supplies failures from the previous iteration, re-run
+    // only those tests via --test-list instead of the whole spec file.
+    let testListArg = '';
+    if (Array.isArray(opts.onlyFailures) && opts.onlyFailures.length > 0) {
+      const listPath = this._writeTestListFile(specFilter, opts.onlyFailures);
+      if (listPath) {
+        testListArg = ` --test-list="${listPath}"`;
+      }
+    }
 
     try {
       const startTime = Date.now();
@@ -461,12 +532,17 @@ class Executor {
       // on CLI because it overrides the config, and PLAYWRIGHT_JSON_OUTPUT_NAME env var
       // does not work in this Playwright version.
       const allResultsFile = path.join(this.resultsDir, 'all-results.json');
+      // Generous wall-clock cap: a11y suites run two WCAG audits with
+      // per-test setTimeout overrides up to 5 min each; with one retry the
+      // whole spec can legitimately exceed 20 min. An outer cap that is
+      // shorter silently kills the suite and produces no results file.
+      const execTimeout = Math.max(1500000, (this.testTimeout || 60000) * 25);
       execSync(
-        `npx playwright test --config="playwright.config.ts" "${specFilter}" 2>&1 || true`,
+        `npx playwright test --config="playwright.config.ts" "${specFilter}"${testListArg} 2>&1 || true`,
         {
           cwd: this.runDir,
           env: { ...process.env },
-          timeout: 120000,
+          timeout: execTimeout,
           stdio: 'pipe',
         }
       );
@@ -484,7 +560,15 @@ class Executor {
     if (fs.existsSync(resultsFile)) {
       try {
         const report = JSON.parse(fs.readFileSync(resultsFile, 'utf-8'));
-        return this.parseReport(report, result);
+        const parsed = this.parseReport(report, result);
+        // If a --test-list run matched zero tests (e.g. the healer renamed a
+        // test), fall back to running the whole file once so we never report
+        // a false "0 tests = success".
+        if (testListArg && parsed.total === 0) {
+          console.warn(`--test-list matched no tests in ${specFilter} — running full file`);
+          return this.execute(specFile);
+        }
+        return parsed;
       } catch {
         // JSON parse failed — treat as all failed
         result.failed = 1;
@@ -522,9 +606,10 @@ class Executor {
   parseReport(report, result) {
     if (!report.suites) return result;
 
-    const flattenTests = (suites) => {
+    const flattenTests = (suites, titlePath = []) => {
       const tests = [];
       for (const suite of suites) {
+        const childTitles = suite.title && !suite.file ? [...titlePath, suite.title] : titlePath;
         if (suite.specs) {
           for (const spec of suite.specs) {
             for (const test of spec.tests || []) {
@@ -538,10 +623,12 @@ class Executor {
               const failResult = results.find(r => r.status === 'unexpected') || lastResult;
               tests.push({
                 name: spec.title,
+                titlePath: [...childTitles, spec.title],
                 status: test.status,
                 duration: results.reduce((sum, r) => sum + (r.duration || 0), 0),
                 error: failResult.error?.message || null,
                 snippet: failResult.error?.snippet || null,
+                errorContext: failResult.error?.errorContext || null,
                 retry: results.length - 1,
                 flaky,
                 // Screenshot path from the failing result (if any)
@@ -551,7 +638,7 @@ class Executor {
           }
         }
         if (suite.suites) {
-          tests.push(...flattenTests(suite.suites));
+          tests.push(...flattenTests(suite.suites, childTitles));
         }
       }
       return tests;
@@ -568,8 +655,10 @@ class Executor {
       .filter(t => t.status === 'unexpected')
       .map(t => ({
         testName: t.name,
+        titlePath: t.titlePath,
         reason: t.error || 'Test failed',
         snippet: t.snippet,
+        errorContext: t.errorContext,
         type: 'test_failure',
         screenshot: t.screenshot,
       }));

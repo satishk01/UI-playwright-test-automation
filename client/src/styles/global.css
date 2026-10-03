@@ -274,6 +274,7 @@ input, select, textarea, button {
 .stat-value.pass { color: var(--success); }
 .stat-value.fail { color: var(--error); }
 .stat-value.fixme { color: var(--warning); }
+.stat-value.skipped { color: var(--text-muted); }
 .stat-value.total { color: var(--accent); }
 
 .stat-label {

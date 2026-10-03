@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "description": "Autonomous E2E test generation agent — explore, plan, generate, and self-heal Playwright tests",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "install:all": "npm install && cd client && npm install",
+    "postinstall": "playwright install",
     "dev:server": "node server/index.js",
     "dev:client": "cd client && npx vite --host",
     "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
@@ -16,12 +20,12 @@
     "@anthropic-ai/sdk": "^0.39.0",
     "@aws-sdk/client-bedrock-runtime": "^3.700.0",
     "@axe-core/playwright": "^4.12.1",
-    "@playwright/test": "^1.40.0",
+    "@playwright/test": "^1.63.0",
     "concurrently": "^8.2.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "playwright": "^1.40.0",
+    "playwright": "^1.63.0",
     "uuid": "^9.0.0"
   }
 }
